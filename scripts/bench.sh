@@ -15,7 +15,8 @@
 # BENCH_DIR, so all of them do the same I/O (pczip with "-" "-" does not
 # fsync; neither do gzip and zstd here). Inputs are read once before timing
 # so every run starts with them in the page cache. Outputs are deleted
-# between runs. Every round trip is checked with cmp.
+# between runs. Every timed run's result is checked with cmp, and the script
+# stops at the first failing tool or mismatch.
 #
 # MB/s = (input bytes / 1e6) / wall seconds, for both compression and
 # decompression (input = the uncompressed dataset). Ratio = input bytes /
@@ -35,14 +36,27 @@ PCZIP=$BENCH_DIR/bin/pczip
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# timed OUT IN CMD... runs CMD <IN >OUT once and prints wall seconds.
+# Scratch files for one measurement; removed on any exit.
+OUT=$BENCH_DIR/out.bin
+BACK=$BENCH_DIR/back.bin
+REF=$BENCH_DIR/ref.pcz
+trap 'rm -f "$OUT" "$BACK" "$REF"' EXIT
+
+# timed OUT IN CMD... runs CMD <IN >OUT once and prints wall seconds. It
+# returns non-zero if CMD fails; callers check it with
+# v=$(timed ...) || fail ..., so a failing tool never yields a time.
 timed() {
 	local out=$1 in=$2
 	shift 2
 	local t0=$EPOCHREALTIME
-	"$@" <"$in" >"$out"
+	"$@" <"$in" >"$out" || return 1
 	local t1=$EPOCHREALTIME
 	awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.6f\n", b - a }'
+}
+
+fail() {
+	echo "FAILED: $*" >&2
+	exit 1
 }
 
 # stats prints "median min max" of its numeric arguments.
@@ -66,51 +80,54 @@ RAW=$BENCH_DIR/raw-times.tsv
 printf 'dataset\tconfig\tphase\tseconds...\n' >"$RAW"
 ROWS=()
 
-# measure DATASET LABEL EXT "COMPRESS CMD" "DECOMPRESS CMD"|""
-# A config without its own timed decompression is still decompressed once
-# (untimed) with pczip/gzip/zstd -d and checked with cmp.
+# measure DATASET LABEL PCZ
+#
+# The commands come from three global arrays, set by the caller:
+#   CCMD  compresses stdin to stdout (timed, BENCH_RUNS times);
+#   DCMD  decompresses stdin to stdout, timed BENCH_RUNS times, or empty
+#         for no timed decompression;
+#   VCMD  decompresses stdin to stdout, untimed, to check each compress run.
+# After every timed compress run, the output is decompressed with VCMD and
+# compared with cmp; after every timed decompress run, the output is
+# compared with cmp. PCZ=1 also checks that the compressed bytes are
+# identical to the first pczip config's for this dataset.
 measure() {
-	local ds=$1 label=$2 ext=$3 ccmd=$4 dcmd=$5 verify=$6
-	local in=$BENCH_DIR/$ds.bin out=$BENCH_DIR/out.$ext back=$BENCH_DIR/back.bin
-	local n ct=() dt=() i
+	local ds=$1 label=$2 pcz=$3
+	local in=$BENCH_DIR/$ds.bin n ct=() dt=() i t csize
 	n=$(stat -c %s "$in")
 	for ((i = 0; i < BENCH_RUNS; i++)); do
-		rm -f "$out"
-		# shellcheck disable=SC2086
-		ct+=("$(timed "$out" "$in" $ccmd)")
-	done
-	local csize
-	csize=$(stat -c %s "$out")
-	if [[ -n $dcmd ]]; then
-		for ((i = 0; i < BENCH_RUNS; i++)); do
-			rm -f "$back"
-			# shellcheck disable=SC2086
-			dt+=("$(timed "$back" "$out" $dcmd)")
-		done
-	else
-		rm -f "$back"
-		# shellcheck disable=SC2086
-		$verify <"$out" >"$back"
-	fi
-	cmp "$in" "$back" || { echo "ROUND TRIP FAILED: $ds $label" >&2; exit 1; }
-	if [[ $ext == pcz ]]; then
-		# Compressed output must be byte-identical for every pczip config.
-		if [[ -f $BENCH_DIR/ref.pcz ]]; then
-			cmp "$out" "$BENCH_DIR/ref.pcz" || { echo "pczip output differs: $ds $label" >&2; exit 1; }
-		else
-			cp "$out" "$BENCH_DIR/ref.pcz"
+		rm -f "$OUT" "$BACK"
+		t=$(timed "$OUT" "$in" "${CCMD[@]}") || fail "$ds $label: compress run $((i + 1)) exited non-zero"
+		ct+=("$t")
+		"${VCMD[@]}" <"$OUT" >"$BACK" || fail "$ds $label: decompress for check"
+		cmp "$in" "$BACK" || fail "$ds $label: round trip after compress run $((i + 1))"
+		if ((pcz)); then
+			if [[ -f $REF ]]; then
+				cmp "$OUT" "$REF" || fail "$ds $label: pczip output differs between configs"
+			else
+				cp "$OUT" "$REF"
+			fi
 		fi
+	done
+	csize=$(stat -c %s "$OUT")
+	if ((${#DCMD[@]})); then
+		for ((i = 0; i < BENCH_RUNS; i++)); do
+			rm -f "$BACK"
+			t=$(timed "$BACK" "$OUT" "${DCMD[@]}") || fail "$ds $label: decompress run $((i + 1)) exited non-zero"
+			dt+=("$t")
+			cmp "$in" "$BACK" || fail "$ds $label: round trip after decompress run $((i + 1))"
+		done
 	fi
 	printf '%s\t%s\tcompress\t%s\n' "$ds" "$label" "${ct[*]}" >>"$RAW"
 	local dcell="–"
-	if [[ -n $dcmd ]]; then
+	if ((${#DCMD[@]})); then
 		printf '%s\t%s\tdecompress\t%s\n' "$ds" "$label" "${dt[*]}" >>"$RAW"
 		dcell=$(cell "$n" "$(stats "${dt[@]}")")
 	fi
 	local ratio
 	ratio=$(awk -v a="$n" -v b="$csize" 'BEGIN { printf "%.3f", a / b }')
 	ROWS+=("| $ds | $label | $ratio | $(cell "$n" "$(stats "${ct[@]}")") | $dcell |")
-	rm -f "$out" "$back"
+	rm -f "$OUT" "$BACK"
 	echo "done: $ds $label" >&2
 }
 
@@ -123,29 +140,42 @@ for ds in text logs mixed; do
 	echo "generating $ds ($BENCH_SIZE, seed 1)" >&2
 	"$BENCH_DIR/bin/gendata" -kind "$ds" -size "$BENCH_SIZE" -out "$in"
 	cat "$in" >/dev/null # warm the page cache
-	rm -f "$BENCH_DIR/ref.pcz"
+	rm -f "$REF"
 
 	for sched in static steal; do
 		for w in "${wlist[@]}"; do
-			d=""
-			[[ $sched == steal && $w == "$MAXW" ]] && d="$PCZIP -d -workers $w -sched steal - -"
-			measure "$ds" "pczip -sched $sched -workers $(wlabel "$w")" pcz \
-				"$PCZIP -workers $w -sched $sched - -" "$d" "$PCZIP -d - -"
+			CCMD=("$PCZIP" -workers "$w" -sched "$sched" - -)
+			VCMD=("$PCZIP" -d - -)
+			DCMD=()
+			# Timed decompression on 1 worker (like-for-like with the
+			# single-threaded gzip -d and zstd -d) and on all cores.
+			if [[ $sched == steal && ($w == 1 || $w == "$MAXW") ]]; then
+				DCMD=("$PCZIP" -d -workers "$w" -sched steal - -)
+			fi
+			measure "$ds" "pczip -sched $sched -workers $(wlabel "$w")" 1
 		done
 	done
 	if have gzip; then
-		measure "$ds" "gzip -1" gz "gzip -1 -c" "gzip -d -c" ""
-		measure "$ds" "gzip -6" gz "gzip -6 -c" "gzip -d -c" ""
+		VCMD=(gzip -d -c)
+		DCMD=(gzip -d -c)
+		CCMD=(gzip -1 -c)
+		measure "$ds" "gzip -1" 0
+		CCMD=(gzip -6 -c)
+		measure "$ds" "gzip -6" 0
 	else
 		echo "gzip not installed; skipping" >&2
 	fi
 	if have zstd; then
-		measure "$ds" "zstd -1 -T0" zst "zstd -q -1 -T0 -c" "zstd -q -d -c" ""
-		measure "$ds" "zstd -1 -T1" zst "zstd -q -1 -T1 -c" "zstd -q -d -c" ""
+		VCMD=(zstd -q -d -c)
+		DCMD=(zstd -q -d -c)
+		CCMD=(zstd -q -1 -T0 -c)
+		measure "$ds" "zstd -1 -T0" 0
+		CCMD=(zstd -q -1 -T1 -c)
+		measure "$ds" "zstd -1 -T1" 0
 	else
 		echo "zstd not installed; skipping" >&2
 	fi
-	rm -f "$BENCH_DIR/ref.pcz"
+	rm -f "$REF"
 done
 
 echo

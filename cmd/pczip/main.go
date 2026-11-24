@@ -219,20 +219,28 @@ func (g *tempGuard) release(fn func() error) error {
 	return fn()
 }
 
-// exitFunc is os.Exit; a variable so tests can observe the interrupt path.
-var exitFunc = os.Exit
-
 // guardSignals arranges for SIGINT and SIGTERM to remove g's temp file and
-// exit with status 130. The returned stop function undoes this.
+// exit with status 130. A signal the process already ignores (for example
+// SIGINT under nohup or in a background job) stays ignored. The returned
+// stop function undoes this.
 func guardSignals(g *tempGuard) (stop func()) {
+	var watch []os.Signal
+	for _, s := range []os.Signal{syscall.SIGINT, syscall.SIGTERM} {
+		if !signal.Ignored(s) {
+			watch = append(watch, s)
+		}
+	}
+	if len(watch) == 0 {
+		return func() {}
+	}
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigs, watch...)
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-sigs:
 			g.interrupt()
-			exitFunc(exitInterrupted)
+			os.Exit(exitInterrupted)
 		case <-done:
 		}
 	}()

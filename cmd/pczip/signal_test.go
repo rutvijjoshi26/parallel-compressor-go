@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,6 +19,9 @@ import (
 // separate go build.
 func TestMain(m *testing.M) {
 	if os.Getenv("PCZIP_TEST_MAIN") == "1" {
+		if os.Getenv("PCZIP_TEST_IGNORE_INT") == "1" {
+			signal.Ignore(syscall.SIGINT)
+		}
 		main()
 		return
 	}
@@ -87,6 +91,74 @@ func TestCLIInterruptRemovesTemp(t *testing.T) {
 				t.Fatalf("output exists after interrupt (stat err %v)", err)
 			}
 		})
+	}
+}
+
+// TestCLIIgnoredSignalStaysIgnored starts pczip with SIGINT ignored (as
+// nohup or a background job would) and checks that SIGINT neither stops it
+// nor removes its temp file; SIGTERM, not ignored, still cleans up.
+func TestCLIIgnoredSignalStaysIgnored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no signals on windows")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.pcz")
+	// The child ignores SIGINT itself before running main, because os/exec
+	// cannot start a process with a signal ignored.
+	cmd := exec.Command(os.Args[0], "-workers", "1", "-", out)
+	cmd.Env = append(os.Environ(), "PCZIP_TEST_MAIN=1", "PCZIP_TEST_IGNORE_INT=1")
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pw.Close()
+	cmd.Stdin = pr
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pr.Close()
+	if _, err := pw.Write(testInput(1 << 20)); err != nil {
+		t.Fatal(err)
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", out, cmd.Process.Pid)
+	waitFor(t, cmd, tmp, &stderr)
+
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(tmp); err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		t.Fatalf("ignored SIGINT removed the temp file or stopped pczip: %v; stderr: %s", err, stderr.String())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	err = cmd.Wait()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 130 {
+		t.Fatalf("wait: %v, want exit status 130; stderr: %s", err, stderr.String())
+	}
+	assertNoTemp(t, dir)
+}
+
+// waitFor waits up to 10 s for path to exist, killing cmd on timeout.
+func waitFor(t *testing.T, cmd *exec.Cmd, path string, stderr *strings.Builder) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatalf("%s never appeared; stderr: %s", path, stderr.String())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
