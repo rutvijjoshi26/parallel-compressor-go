@@ -33,6 +33,23 @@ func randomBytes(n int) []byte {
 	return b
 }
 
+// markedRuns returns about n bytes of random runs, 270 to 310 bytes each,
+// each followed by the same 4-byte marker. The markers give the encoder
+// cheap matches while the runs stay incompressible, so the LZ output tracks
+// the raw size closely and hits the early bailout mid-stream.
+func markedRuns(seed int64, n int) []byte {
+	r := rand.New(rand.NewSource(seed))
+	marker := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	var b []byte
+	for len(b) < n {
+		run := make([]byte, 270+r.Intn(41))
+		r.Read(run)
+		b = append(b, run...)
+		b = append(b, marker...)
+	}
+	return b
+}
+
 func roundTrip(t testing.TB, src []byte) {
 	t.Helper()
 	payload := EncodeBlock(nil, src)
@@ -153,6 +170,9 @@ func FuzzBlockRoundTrip(f *testing.F) {
 	f.Add([]byte("a"))
 	f.Add([]byte("abcabcabcabcabcabcabc"))
 	f.Add(englishText(3000))
+	// Inputs that trip the encoder's early bailout (see TestBailoutFallsBackToRaw).
+	f.Add(markedRuns(1, 8<<10))
+	f.Add(markedRuns(7, 8<<10))
 	f.Fuzz(func(t *testing.T, src []byte) { roundTrip(t, src) })
 }
 
@@ -225,5 +245,27 @@ func TestDecodeTinyPayloadSmallAlloc(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if got := after.TotalAlloc - before.TotalAlloc; got > 64<<10 {
 		t.Fatalf("4 decodes allocated %d bytes, want <= 64 KiB", got)
+	}
+}
+
+// TestBailoutFallsBackToRaw: when encodeLZ bails out early, EncodeBlock
+// must store the block raw rather than emit the partial LZ stream.
+func TestBailoutFallsBackToRaw(t *testing.T) {
+	for seed := int64(1); seed <= 32; seed++ {
+		src := markedRuns(seed, 64<<10)
+		payload := EncodeBlock(nil, src)
+		if len(payload) > 1+len(src) {
+			t.Fatalf("seed %d: payload %d bytes, want <= %d", seed, len(payload), 1+len(src))
+		}
+		if payload[0] != modeLZ && payload[0] != modeRaw {
+			t.Fatalf("seed %d: bad mode %#x", seed, payload[0])
+		}
+		got, err := DecodeBlock(nil, payload, len(src))
+		if err != nil {
+			t.Fatalf("seed %d: decode (mode %#x, %d bytes): %v", seed, payload[0], len(payload), err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("seed %d: round trip mismatch", seed)
+		}
 	}
 }

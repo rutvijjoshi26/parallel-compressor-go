@@ -77,8 +77,8 @@ func appendSequence(dst, lits []byte, offset, matchLen int) []byte {
 func EncodeBlock(dst, src []byte) []byte {
 	start := len(dst)
 	dst = append(dst, modeLZ)
-	dst = encodeLZ(dst, src, start+1+len(src))
-	if len(dst)-start < 1+len(src) {
+	dst, ok := encodeLZ(dst, src, start+1+len(src))
+	if ok && len(dst)-start < 1+len(src) {
 		return dst
 	}
 	dst = append(dst[:start], modeRaw)
@@ -86,8 +86,10 @@ func EncodeBlock(dst, src []byte) []byte {
 }
 
 // encodeLZ appends the sequence stream for src to dst. It stops early once
-// the output reaches limit bytes, since raw mode will win anyway.
-func encodeLZ(dst, src []byte, limit int) []byte {
+// the output reaches limit bytes, since raw mode will win anyway, and then
+// returns ok = false: the partial stream lacks its last sequence and must
+// not be used.
+func encodeLZ(dst, src []byte, limit int) (out []byte, ok bool) {
 	var table [hashSize]int32 // position+1; 0 means empty
 	anchor := 0
 	i := 0
@@ -96,7 +98,7 @@ func encodeLZ(dst, src []byte, limit int) []byte {
 		// Pending literals will be emitted too, so count them: on
 		// incompressible input this bails out as soon as raw must win.
 		if len(dst)+(i-anchor) >= limit {
-			return dst
+			return dst, false
 		}
 		v := binary.LittleEndian.Uint32(src[i:])
 		h := hash4(v)
@@ -117,7 +119,7 @@ func encodeLZ(dst, src []byte, limit int) []byte {
 		i += n
 		anchor = i
 	}
-	return appendSequence(dst, src[anchor:], 0, 0)
+	return appendSequence(dst, src[anchor:], 0, 0), true
 }
 
 // readLen reads continuation bytes for a nibble of 15, adding them to n.
