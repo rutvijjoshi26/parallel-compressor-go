@@ -1,0 +1,4 @@
+/pczip
+*.pcz
+*.tmp-*
+/bench-out/
