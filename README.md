@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/rutvijjoshi26/parallel-compressor-go/actions/workflows/ci.yml/badge.svg)](https://github.com/rutvijjoshi26/parallel-compressor-go/actions/workflows/ci.yml)
 
-pczip splits its input into independent blocks and compresses them on
-several goroutines at once. Memory stays bounded whatever the input size.
-It has two block schedulers: static partitioning and work stealing over a
-Chase–Lev deque. The codec is an LZ4-style match finder, written from
-scratch. Every block is stored in a checksummed container format, and the
-decoder is fuzzed against hostile input. The whole thing is standard-library
-Go with no dependencies. It also has race-detector tests, and the error
-paths are tested too: a failed run never leaves a partial output file.
+pczip splits its input into independent blocks, then compresses and
+decompresses them in parallel with bounded memory. It has two block
+schedulers, static partitioning and Chase–Lev work stealing, and an
+LZ4-style codec written from scratch. Blocks go into a checksummed
+container format, and the project uses only the Go standard library. The
+decoder is fuzzed against hostile input, the concurrent code runs under the
+race detector, and a failed run that writes to a file leaves no partial
+output behind.
 
 It is a systems exercise, not a zstd replacement. The results below say
 plainly where it wins and where it loses.
@@ -118,12 +118,14 @@ It rejects all of the following:
 
 ## Design decisions and trade-offs
 
-**Independent blocks.** No block refers to another block's bytes, the same
-approach as pigz, `zstd -T` and LZ4 frames. This makes compression and
-decompression both parallel. It also makes the output byte-identical for
-every worker count and scheduler; the tests check this, and so did every
-benchmark run. The cost is ratio: a match can never reach back into the
-previous block, and every block starts with an empty hash table.
+**Independent blocks.** No block refers to another block's bytes. LZ4
+frames in block-independent mode and `pigz -i` work the same way. Plain
+pigz and `zstd -T` also compress in parallel, but they chain each block to
+the data before it, so decompression is serial. Because pczip's blocks are
+independent, they also decompress in parallel. Independence also makes the
+output byte-identical for every worker count and scheduler; the tests check
+this, and so did every benchmark run. The cost is ratio: no match can reach
+into another block, and every block starts with an empty hash table.
 
 **Raw fallback.** A block is stored raw (mode `0xFF`) unless the LZ form is
 strictly smaller. The encoder also gives up early once its output plus
@@ -170,8 +172,7 @@ measured here. `steal` is the default because it is designed for uneven
 blocks, and on even blocks it measured only a few percent slower. That
 choice is a design judgment, not a measured win.
 
-**Testing.** The tests are meant to catch real bugs, not to pad a coverage
-number:
+**Testing.**
 
 - **Fuzzing.** Three fuzz targets:
   - `FuzzDecodeBlock` feeds arbitrary payloads to the block decoder.
@@ -203,7 +204,8 @@ number:
 - **An entropy stage** (Huffman or FSE) after the match finder, to close
   part of the ratio gap with zstd.
 - **Streaming dictionaries:** prime each block with the tail of the previous
-  block, as pigz does. This trades independent decoding for ratio.
+  block, as plain pigz does. This gains ratio, but decompression would
+  become serial.
 - **Measure on 8 or more cores,** with uneven block costs, to find out
   whether work stealing earns its place.
 
@@ -248,15 +250,15 @@ leaves no output file.
 | code | meaning |
 |---|---|
 | 0 | success |
-| 1 | runtime error (I/O, or a corrupt or truncated input); no output file is left |
+| 1 | runtime error (I/O, or a corrupt or truncated input); a file OUT is not created |
 | 2 | usage error (bad flag or value, wrong number of arguments, IN and OUT the same file) |
-| 130 | interrupted by SIGINT or SIGTERM; the temp file is removed |
+| 130 | interrupted by SIGINT or SIGTERM while writing a file; the temp file is removed |
 
 Errors go to stderr, so stdout carries only data.
 
-**Windows.** pczip is a plain CLI with no Windows-specific code, and it
-works the same way there. CI runs the test suite on Linux, macOS and
-Windows. Some tests are skipped on Windows:
+**Windows.** pczip is a plain CLI with no Windows-specific code, and it is
+expected to work the same way there. CI runs the test suite on Linux, macOS
+and Windows. Some tests are skipped on Windows:
 
 - the two signal tests, so Ctrl-C cleanup is tested only on Linux and macOS;
 - the unwritable-directory test, because Windows does not use Unix
