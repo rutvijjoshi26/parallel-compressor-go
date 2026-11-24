@@ -21,7 +21,8 @@ with one worker the scheduler is not used, and `-sched static` is within 3%.
 
 - **zstd -1 beats pcz on every dataset on ratio, compression speed and
   decompression speed.** On one core zstd compresses 1.2–1.4× faster and
-  decompresses 1.7–2.4× faster, and its output is 31–64% smaller.
+  decompresses 1.7–2.4× faster, and pcz's output is 31–64% larger than
+  zstd's.
 - **Against gzip -1, pcz compresses 2.4–4.2× faster and decompresses
   1.9–2.2× faster, but its output is 22–39% larger.**
 - pcz has the lowest ratio of all the tools on all three datasets. Its codec
@@ -35,8 +36,8 @@ with one worker the scheduler is not used, and `-sched static` is within 3%.
   decompression on one core is still faster than pcz on two for `text`
   (497 vs 363) and `mixed` (709 vs 486), and about equal for `logs`
   (665 vs 650, overlapping ranges).
-- **Scaling 1 → 2 workers:** pcz compression gains 1.78–1.92× and
-  decompression 1.64–1.78×. `zstd -T0` gains 1.61–1.75× over `-T1` on
+- **Scaling 1 → 2 workers:** pcz compression gains 1.79–1.86× and
+  decompression 1.64–1.78×. `zstd -T0` gains 1.61–1.74× over `-T1` on
   compression.
 - **Scheduler:** with 2 workers, `static`, `steal` (Chase–Lev work
   stealing) and a plain atomic-counter baseline perform within a few
@@ -209,8 +210,9 @@ of cores used.** Five runs (`-count=5`) of 3 iterations each; median
 
 Compression ratio on this input: 1.708. With 1 worker all three schedulers
 run the blocks inline on the calling goroutine, so the 1-worker rows measure
-the same code path. In-process decompression is faster than the CLI figures
-because it has no pipe or file I/O.
+the same code path. In-process decompression is faster than the CLI figures,
+likely because it has no pipe or file I/O (not measured separately; the
+input sizes also differ: 32 MiB here, 256 MiB in the CLI runs).
 
 On 2 cores with blocks of similar cost, work stealing does not beat static
 partitioning or the atomic counter. Stealing is designed to help when block
