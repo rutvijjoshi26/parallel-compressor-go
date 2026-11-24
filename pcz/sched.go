@@ -54,10 +54,18 @@ type errState struct {
 	err    error
 }
 
+// afterFail, when non-nil, runs once right after the first error is
+// recorded. It is a test seam (nil in production) that lets tests order
+// events deterministically around the failure.
+var afterFail func()
+
 func (e *errState) set(err error) {
 	e.once.Do(func() {
 		e.err = err
 		e.failed.Store(true)
+		if afterFail != nil {
+			afterFail()
+		}
 	})
 }
 
@@ -66,6 +74,9 @@ func (e *errState) set(err error) {
 // started is skipped. With workers <= 1 or n <= 1, fn runs inline on the
 // caller's goroutine.
 func forEachBlock(n, workers int, sched Sched, fn func(i int) error) error {
+	if sched != Static && sched != Steal {
+		return fmt.Errorf("pcz: unknown scheduler %v", sched)
+	}
 	if n <= 0 {
 		return nil
 	}
@@ -80,14 +91,10 @@ func forEachBlock(n, workers int, sched Sched, fn func(i int) error) error {
 		}
 		return nil
 	}
-	switch sched {
-	case Static:
+	if sched == Static {
 		return runStatic(n, workers, fn)
-	case Steal:
-		return runSteal(n, workers, fn)
-	default:
-		return fmt.Errorf("pcz: unknown scheduler %v", sched)
 	}
+	return runSteal(n, workers, fn)
 }
 
 // runStatic splits [0,n) into workers contiguous chunks whose sizes differ

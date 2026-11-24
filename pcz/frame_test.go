@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -136,6 +137,7 @@ func TestFrameRejects(t *testing.T) {
 		{"rawLen > blockSize", frameHeaderBytes(bs+1, 10, 0)},
 		{"compLen > blockSize+64", frameHeaderBytes(10, bs+65, 0)},
 		{"compLen 0 with rawLen > 0", frameHeaderBytes(10, 0, 0)},
+		{"rawLen 0 with compLen > 0", append(frameHeaderBytes(0, 3, 0), 0xFF, 'h', 'i')},
 		{"end frame with nonzero crc", frameHeaderBytes(0, 0, 1)},
 		{"truncated frame header", frameHeaderBytes(2, 3, 0)[:11]},
 		{"truncated payload", good[:len(good)-1]},
@@ -184,6 +186,36 @@ func TestHugeLengthsNoAlloc(t *testing.T) {
 	})
 	if allocs > 2 {
 		t.Fatalf("compLen reject path allocated %.1f times per run, want <= 2", allocs)
+	}
+}
+
+// A truncated stream whose frame claims a ~1 MiB payload must not make the
+// reader allocate that much before discovering the truncation.
+func TestTruncatedPayloadSmallAlloc(t *testing.T) {
+	data := headerBytes("PCZ3", 3, 0, 1<<20)
+	data = append(data, frameHeaderBytes(1<<20, 1<<20-5, 0)...)
+	data = append(data, make([]byte, 30-len(data))...) // 30 bytes total
+	if len(data) != 30 {
+		t.Fatalf("stream is %d bytes, want 30", len(data))
+	}
+	const runs = 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < runs; i++ {
+		r := bytes.NewReader(data)
+		bs, err := readHeader(r)
+		if err != nil {
+			t.Fatalf("readHeader: %v", err)
+		}
+		if _, _, err := readFrame(r, bs); !errors.Is(err, ErrFormat) {
+			t.Fatalf("err = %v, want ErrFormat", err)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	perRun := (after.TotalAlloc - before.TotalAlloc) / runs
+	if perRun > 128<<10 {
+		t.Fatalf("truncated 30-byte stream allocated %d bytes per read, want <= 128 KiB", perRun)
 	}
 }
 

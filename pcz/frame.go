@@ -43,6 +43,7 @@ var (
 	errRawTooLong    = fmt.Errorf("%w: frame raw length exceeds block size", ErrFormat)
 	errCompTooLong   = fmt.Errorf("%w: frame payload length exceeds block size + %d", ErrFormat, maxPayloadSlack)
 	errEmptyFrame    = fmt.Errorf("%w: frame has raw bytes but no payload", ErrFormat)
+	errPayloadNoRaw  = fmt.Errorf("%w: frame has a payload but no raw bytes", ErrFormat)
 	errEndFrameCRC   = fmt.Errorf("%w: end frame has nonzero crc", ErrFormat)
 	errWriteEndFrame = errors.New("pcz: frame with no raw bytes and no payload would read as the end frame")
 )
@@ -127,6 +128,16 @@ func writeEnd(w io.Writer) error {
 // It bounds-checks the lengths before allocating; the CRC is verified by
 // the caller after decoding.
 func readFrame(r io.Reader, blockSize int) (f frame, end bool, err error) {
+	return readFrameBuf(r, blockSize, nil)
+}
+
+// payloadChunk caps the initial payload allocation, so a truncated stream
+// that claims a large compLen cannot force a large allocation up front.
+const payloadChunk = 64 << 10
+
+// readFrameBuf is readFrame, reading the payload into buf's storage when its
+// capacity suffices (the returned payload may alias buf).
+func readFrameBuf(r io.Reader, blockSize int, buf []byte) (f frame, end bool, err error) {
 	var b [frameHeaderSize]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		switch err {
@@ -146,6 +157,8 @@ func readFrame(r io.Reader, blockSize int) (f frame, end bool, err error) {
 			return frame{}, false, errEndFrameCRC
 		}
 		return frame{}, true, nil
+	case rawLen == 0:
+		return frame{}, false, errPayloadNoRaw
 	case rawLen > uint64(blockSize):
 		return frame{}, false, errRawTooLong
 	case compLen > uint64(blockSize)+maxPayloadSlack:
@@ -153,12 +166,40 @@ func readFrame(r io.Reader, blockSize int) (f frame, end bool, err error) {
 	case compLen == 0:
 		return frame{}, false, errEmptyFrame
 	}
-	payload := make([]byte, compLen)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	payload, err := readPayload(r, int(compLen), buf)
+	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return frame{}, false, errTruncPayload
 		}
 		return frame{}, false, err
 	}
 	return frame{rawLen: int(rawLen), crc: crc, payload: payload}, false, nil
+}
+
+// readPayload reads exactly n bytes. It reuses buf when cap(buf) >= n.
+// Otherwise it starts at min(n, payloadChunk) bytes and doubles (capped at
+// n) only as bytes actually arrive, so the allocation tracks real input.
+func readPayload(r io.Reader, n int, buf []byte) ([]byte, error) {
+	if cap(buf) >= n {
+		p := buf[:n]
+		_, err := io.ReadFull(r, p)
+		return p, err
+	}
+	p := make([]byte, 0, min(n, payloadChunk))
+	for len(p) < n {
+		if len(p) == cap(p) {
+			q := make([]byte, len(p), min(2*cap(p), n))
+			copy(q, p)
+			p = q
+		}
+		m, err := io.ReadFull(r, p[len(p):cap(p)])
+		p = p[:len(p)+m]
+		if err != nil {
+			if err == io.EOF && len(p) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return p, nil
 }
