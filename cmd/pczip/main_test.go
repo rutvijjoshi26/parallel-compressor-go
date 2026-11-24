@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -237,26 +238,34 @@ func TestCLISameInOut(t *testing.T) {
 	in := filepath.Join(dir, "in.bin")
 	data := testInput(50_000)
 	writeFile(t, in, data)
+	// Windows can refuse to create links (symlinks need Developer Mode or
+	// admin rights), so there a failed link only skips its own case.
+	linkErr := func(err error) error {
+		if err != nil && runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+		return err
+	}
 	link := filepath.Join(dir, "link.bin")
-	if err := os.Symlink(in, link); err != nil {
-		t.Fatal(err)
-	}
+	symErr := linkErr(os.Symlink(in, link))
 	hard := filepath.Join(dir, "hard.bin")
-	if err := os.Link(in, hard); err != nil {
-		t.Fatal(err)
-	}
+	hardErr := linkErr(os.Link(in, hard))
 
 	for _, tc := range []struct {
-		name string
-		args []string
+		name    string
+		args    []string
+		skipErr error
 	}{
-		{"same-path", []string{in, in}},
-		{"unclean-path", []string{in, filepath.Join(dir, ".", "sub", "..", "in.bin")}},
-		{"symlink", []string{in, link}},
-		{"hardlink", []string{in, hard}},
-		{"decompress", []string{"-d", in, in}},
+		{"same-path", []string{in, in}, nil},
+		{"unclean-path", []string{in, filepath.Join(dir, ".", "sub", "..", "in.bin")}, nil},
+		{"symlink", []string{in, link}, symErr},
+		{"hardlink", []string{in, hard}, hardErr},
+		{"decompress", []string{"-d", in, in}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.skipErr != nil {
+				t.Skipf("cannot create link on %s: %v", runtime.GOOS, tc.skipErr)
+			}
 			code, _, stderr := runCLI(t, nil, tc.args...)
 			if code != 2 {
 				t.Fatalf("exit %d, want 2; stderr: %s", code, stderr)
@@ -271,6 +280,9 @@ func TestCLISameInOut(t *testing.T) {
 }
 
 func TestCLIUnwritableDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows ignores Unix directory mode bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}

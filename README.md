@@ -1,175 +1,306 @@
-# Parallel Compressor (Go)
+# pczip: a parallel block compressor in Go
 
-This repository contains a small research/educational parallel compressor written in Go. It implements a simple block-based compression format with an LZ77-style token stream and three implementations:
+[![CI](https://github.com/rutvijjoshi26/parallel-compressor-go/actions/workflows/ci.yml/badge.svg)](https://github.com/rutvijjoshi26/parallel-compressor-go/actions/workflows/ci.yml)
 
-- `seq` — Sequential, single-threaded compressor/decompressor.
-- `bsp` — Bulk Synchronous Parallel (static partitioning of blocks across workers).
-- `ws`  — Work-stealing implementation using a Chase–Lev deque for dynamic load balancing.
+pczip splits its input into independent blocks and compresses them on
+several goroutines at once. Memory stays bounded whatever the input size.
+It has two block schedulers: static partitioning and work stealing over a
+Chase–Lev deque. The codec is an LZ4-style match finder, written from
+scratch. Every block is stored in a checksummed container format, and the
+decoder is fuzzed against hostile input. The whole thing is standard-library
+Go with no dependencies. It also has race-detector tests, and the error
+paths are tested too: a failed run never leaves a partial output file.
 
-The compressor is intended for experimentation and benchmarking of parallel strategies rather than production use.
+It is a systems exercise, not a zstd replacement. The results below say
+plainly where it wins and where it loses.
 
----
+## Results
 
-## Highlights / Features
+On one core, `zstd -1` beats pczip on ratio, compression speed and
+decompression speed for every dataset. pczip beats `gzip -1` on speed: it
+compresses 2.4–4.2× faster and decompresses 1.9–2.2× faster. Its output is
+22–39% larger than gzip's.
 
-- Custom `.pcz` file format with a small file header and per-block compressed sizes.
-- LZ77-like tokenization with a 64KB sliding window and short-match optimization.
-- Block-level decision: store block as raw (mode `0xFF`) or LZ tokens (mode `0x00`) depending on which is smaller.
-- Multiple parallelization strategies (BSP static partitions and work-stealing dynamic scheduling).
-- Small, self-contained implementation with no external Go dependencies (Go 1.19).
+**One core each:** pczip `-workers 1`, single-threaded `gzip`, and
+`zstd -T1`. Decompression is single-threaded for all three. Each dataset is
+256 MiB and each figure is the median of 3 runs. MB/s means uncompressed
+bytes per second, for compression and decompression alike.
 
----
+| dataset | ratio: pczip / gzip -1 / zstd -1 | compress MB/s: pczip / gzip -1 / zstd -1 | decompress MB/s: pczip / gzip -d / zstd -d |
+|---|---|---|---|
+| text | 1.566 / 2.179 / 2.444 | 146 / 48 / 177 | 204 / 109 / 497 |
+| logs | 3.735 / 5.118 / 6.108 | 238 / 101 / 330 | 391 / 186 / 665 |
+| mixed | 1.697 / 2.074 / 2.225 | 210 / 50 / 270 | 296 / 136 / 709 |
 
-## Build / Requirements
+- Against `zstd -1` on one core, zstd compresses 1.2–1.4× faster and
+  decompresses 1.7–2.4× faster. pczip's output is 31–64% larger. pczip has
+  no entropy coding stage, so a lower ratio is expected.
+- pczip has the lowest ratio of all the tools on all three datasets.
 
-- Go 1.19 or newer
-- Python 3 (optional, for the benchmarking script)
-- `matplotlib` (optional, for plotting benchmark results)
+**Two cores (pczip `-workers 2`).** These rows are not like-for-like with
+the gzip rows: gzip is single-threaded, and pigz was not installed, so
+multi-core gzip was not measured. `zstd -T0` used both cores to compress.
+Every zstd and gzip decompression ran on one core.
 
-To build the CLI binary (`pczip` used by the benchmark script):
+| dataset | compress MB/s: pczip 2 cores / zstd -1 -T0 2 cores / gzip -1 1 core | decompress MB/s: pczip 2 cores / zstd -d 1 core / gzip -d 1 core |
+|---|---|---|
+| text | 271 / 309 / 48 | 363 / 497 / 109 |
+| logs | 436 / 530 / 101 | 650 / 665 / 186 |
+| mixed | 377 / 444 / 50 | 486 / 709 / 136 |
 
-```bash
-cd "/Users/rutvijjoshi/Projects/Parallel compression"
-go build -o pczip main.go
+- Going from 1 to 2 workers, pczip compression gains 1.79–1.86× and
+  decompression gains 1.64–1.78×.
+- zstd on 2 cores still compresses faster than pczip on 2 cores on all
+  three datasets. Even on one core, zstd decompresses `text` and `mixed`
+  faster than pczip does on two. On `logs` they are about equal: 650 vs
+  665 MB/s, and the ranges overlap.
+
+**Machine and caveats:**
+
+- **Machine:** an AWS EC2 t4g.medium, which has 2 vCPUs (Graviton2, arm64).
+  It is a burstable instance.
+- **Throttling:** sustained probe runs before the final measurements held
+  steady within ±3%.
+- **Core count:** scaling beyond 2 cores was not measured. Nothing here says
+  how pczip behaves on 4, 8 or more cores.
+- **Data:** the datasets are synthetic: English-like text, JSON logs, and a
+  mix of text, random bytes and zeros. They show how the tools compare on
+  these shapes of data, not what you will get on your own files.
+
+[docs/benchmarks.md](docs/benchmarks.md) has every configuration, with
+min–max ranges, raw wall times, dataset hashes and the reproduction
+commands.
+
+## How it works
+
+```
+                  up to Workers x 4 blocks per batch
+input -> reader -> batch -> scheduler -> encode (one block per task) -> ordered writer -> output
+                            static | steal       in parallel            frames in input order
 ```
 
-You can also run directly with `go run` during development:
+The compressor reads up to `Workers × 4` blocks (1 MiB each by default) into
+a batch. A scheduler hands the block indices to the worker goroutines. Each
+worker encodes its blocks and computes their checksums into per-index slots.
+The writer then emits the frames in input order. Decompression has the same
+shape: it reads a batch of frames, decodes and checks them in parallel, and
+writes the results in order.
 
-```bash
-go run main.go -mode compress -in input.bin -out output.pcz -impl ws -threads 4
-```
+**Codec.** The codec is LZ4-style: a 4-byte minimum match, a 16K-entry hash
+table, offsets up to 64 KiB, and LZ4's skip acceleration on runs of misses.
+Each block is encoded on its own. The codec is LZ4-style but not
+LZ4-compatible, so lz4 tools cannot read its output.
 
----
+### Container format (PCZ3)
+
+All integers are little-endian.
+
+- **Header:** magic `"PCZ3"` (4 bytes), version `u8 = 3`, flags `u8 = 0`,
+  block size `u32`.
+- **Frames:** one per block: `rawLen u32`, `compLen u32`, `crc32 u32` (IEEE,
+  over the raw bytes), then `compLen` payload bytes.
+- **End frame:** the stream ends with a frame where `rawLen = 0` and
+  `compLen = 0` (crc 0, no payload).
+- **Payload:** the first byte is the mode. `0x00` means an LZ4-style
+  sequence stream follows; `0xFF` means raw bytes follow.
+- **Block size:** the default is 1 MiB. The valid range is 4 KiB to 64 MiB,
+  and a reader rejects any value outside it.
+
+**The decoder never** panics, and it never allocates more than
+`blockSize + 64` bytes per block based on numbers it read from the stream.
+It rejects all of the following:
+
+- `rawLen > blockSize`;
+- `compLen > blockSize + 64`;
+- a CRC mismatch;
+- a truncated stream, a missing end frame, or trailing bytes after the end
+  frame.
+
+## Design decisions and trade-offs
+
+**Independent blocks.** No block refers to another block's bytes, the same
+approach as pigz, `zstd -T` and LZ4 frames. This makes compression and
+decompression both parallel. It also makes the output byte-identical for
+every worker count and scheduler; the tests check this, and so did every
+benchmark run. The cost is ratio: a match can never reach back into the
+previous block, and every block starts with an empty hash table.
+
+**Raw fallback.** A block is stored raw (mode `0xFF`) unless the LZ form is
+strictly smaller. The encoder also gives up early once its output plus
+pending literals reaches the raw size, so random data costs little CPU. As a
+result, incompressible input grows by at most 13 bytes per block (a 12-byte
+frame header plus the mode byte) plus 22 bytes per stream (the 10-byte
+header and the 12-byte end frame). A test checks this bound. The cost is one
+byte per block, even for blocks that compress.
+
+**A CRC per block.** Each frame carries a CRC-32 of its raw bytes, which is
+checked after decoding. A corrupt block is reported where it occurs, and
+the check runs in parallel with the decoding. The costs are 4 bytes per
+block and a CRC pass over all the data on both sides. CRC-32 detects
+accidental corruption; it is not a defense against deliberate tampering.
+
+**A bounded in-flight window.** At most `Workers × 4` blocks are in memory
+at once, whatever the input size, and buffers are reused from one batch to
+the next. A test compresses 64 MiB and checks that the heap stays bounded.
+The cost is that batches run in lockstep. The reader waits while a batch
+encodes, and the workers wait while it is written, so I/O does not overlap
+with compression.
+
+**A worker cap.** `-workers` accepts 1 to 1024, and the default is the
+smaller of the CPU count and 8. The cap exists because a stream's header
+picks the block size: a hostile stream that declares 64 MiB blocks makes
+each in-flight slot 64 MiB. With the default of at most 8 workers, that is
+at most 32 such blocks in flight. The cost is that a machine with more than
+8 cores needs an explicit `-workers N` to use them all.
+
+**Work stealing vs static scheduling.** Both schedulers are kept and can be
+chosen with `-sched`:
+
+- `static` gives each worker one contiguous range of blocks.
+- `steal` deals the blocks round-robin into one bounded Chase–Lev deque per
+  worker. Idle workers then steal from the other workers' deques.
+
+With 2 workers, stealing showed no gain. In-process compression measured
+396 MB/s for static, 376 MB/s for steal, and 393 MB/s for a plain
+atomic-counter baseline, which exists only in the benchmark tests (median
+of 5 runs). That puts steal about 5% below static. The reason is that all
+the tasks are dealt out before any worker starts, so stealing only helps
+when block costs vary a lot or there are many workers. Neither case was
+measured here. `steal` is the default because it is designed for uneven
+blocks, and on even blocks it measured only a few percent slower. That
+choice is a design judgment, not a measured win.
+
+**Testing.** The tests are meant to catch real bugs, not to pad a coverage
+number:
+
+- **Fuzzing.** Three fuzz targets:
+  - `FuzzDecodeBlock` feeds arbitrary payloads to the block decoder.
+  - `FuzzReadStream` feeds arbitrary bytes to the container reader and
+    checks that every accepted frame is within its bounds.
+  - `FuzzBlockRoundTrip` checks that any input survives encoding and
+    decoding.
+- **Race detector.** `go test -race` runs on the deque, the schedulers and
+  the full pipeline. The deque's concurrent test has 4 thieves and an owner
+  move 100,000 tasks, and it checks that each task is taken exactly once.
+- **Mutation checks.** Several tests were checked by breaking the code on
+  purpose and confirming that they fail:
+  - **Deque:** removing the CAS from `Steal`, removing it from `Pop`'s
+    last-element path, and reading `top` before reserving `bottom` in `Pop`.
+    The exactly-once test fails ("task N taken 2 times") for each.
+  - **Bounded-memory test:** it fails when the batch limit is raised from 4
+    to 1000 blocks per worker.
+  - **Skip-after-error test:** it fails when workers ignore an earlier
+    error.
+- **Error paths.** Corrupt, truncated and bad-magic streams, and streams
+  with no end frame, all exit with status 1 and leave no output file. Usage
+  errors exit with 2. If the input and output are the same file, even
+  through a symlink or a hard link, pczip refuses with exit 2 and leaves the
+  input untouched. An unwritable output directory gives exit 1. SIGINT and
+  SIGTERM remove the temp file.
+
+## What I'd do next
+
+- **An entropy stage** (Huffman or FSE) after the match finder, to close
+  part of the ratio gap with zstd.
+- **Streaming dictionaries:** prime each block with the tail of the previous
+  block, as pigz does. This trades independent decoding for ratio.
+- **Measure on 8 or more cores,** with uneven block costs, to find out
+  whether work stealing earns its place.
 
 ## Usage
 
-The program is a CLI with flags:
+Install the CLI. This needs Go 1.22 or later:
 
-- `-mode` : `compress` or `decompress`
-- `-in`   : input file path
-- `-out`  : output file path
-- `-impl` : implementation (`seq`, `bsp`, or `ws`) — default `seq`
-- `-threads`: number of worker threads for parallel implementations (default `4`)
-
-Examples
-
-Compress with the sequential implementation:
-
-```bash
-go run main.go -mode compress -in sample.bin -out sample.pcz -impl seq
+```
+go install github.com/rutvijjoshi26/parallel-compressor-go/cmd/pczip@latest
 ```
 
-Compress with work-stealing (8 workers):
+The command line is:
 
-```bash
-go run main.go -mode compress -in sample.bin -out sample_ws.pcz -impl ws -threads 8
+```
+pczip [-d] [-workers N] [-sched static|steal] [-block SIZE] IN OUT
 ```
 
-Decompress (uses the same `impl` flags; any implementation will yield the same result):
+Flags go before `IN` and `OUT`. Either one may be `-`, for stdin or stdout.
 
-```bash
-go run main.go -mode decompress -in sample_ws.pcz -out sample_restored.bin -impl seq
+```
+pczip data.log data.log.pcz                 # compress a file
+pczip -d data.log.pcz data.log              # decompress it
+pczip -workers 4 -block 4MiB big.bin big.pcz
+pczip - - < data.log > data.log.pcz         # stdin to stdout
+tar cf - dir | pczip - backup.tar.pcz       # compress a stream
+pczip -d backup.tar.pcz - | tar xf -        # decompress a stream
 ```
 
-Verify integrity (quick approach on macOS/Linux):
+| flag | default | meaning |
+|---|---|---|
+| `-d` | off | decompress instead of compress |
+| `-workers N` | the CPU count, at most 8 | worker goroutines, 1 to 1024 |
+| `-sched` | `steal` | block scheduler: `static` or `steal` |
+| `-block SIZE` | `1MiB` | block size for compression, 4KiB to 64MiB, in bytes or with a `KiB`/`MiB` suffix; with `-d`, the block size comes from the stream header and this flag is ignored |
 
-```bash
-shasum -a 256 sample.bin sample_restored.bin
-# or
-md5 sample.bin sample_restored.bin
+A file output is written to `OUT.tmp-<pid>` in the same directory, synced,
+and then renamed to `OUT` only if everything succeeded. So a failed run
+leaves no output file.
+
+**Exit codes:**
+
+| code | meaning |
+|---|---|
+| 0 | success |
+| 1 | runtime error (I/O, or a corrupt or truncated input); no output file is left |
+| 2 | usage error (bad flag or value, wrong number of arguments, IN and OUT the same file) |
+| 130 | interrupted by SIGINT or SIGTERM; the temp file is removed |
+
+Errors go to stderr, so stdout carries only data.
+
+**Windows.** pczip is a plain CLI with no Windows-specific code, and it
+works the same way there. CI runs the test suite on Linux, macOS and
+Windows. Some tests are skipped on Windows:
+
+- the two signal tests, so Ctrl-C cleanup is tested only on Linux and macOS;
+- the unwritable-directory test, because Windows does not use Unix
+  permission bits;
+- the symlink and hard-link cases of the same-file test, but only if
+  Windows refuses to create the link.
+
+## Testing and benchmarks
+
+```
+go vet ./...
+go test -race ./...
+
+# fuzz one target at a time (-fuzz accepts one package)
+go test -run='^$' -fuzz='^FuzzDecodeBlock$'    -fuzztime=30s ./pcz/
+go test -run='^$' -fuzz='^FuzzReadStream$'     -fuzztime=30s ./pcz/
+go test -run='^$' -fuzz='^FuzzBlockRoundTrip$' -fuzztime=30s ./pcz/
+
+# in-process scheduler benchmarks (static, steal, atomic-counter)
+go test -run='^$' -bench=. -benchtime=3x -count=5 ./pcz/
+
+# CLI benchmarks against gzip and zstd (needs ~2 GB free in BENCH_DIR)
+export BENCH_DIR=$HOME/bench-data
+bash scripts/bench.sh
+rm -rf "$BENCH_DIR"
 ```
 
----
+`scripts/bench.sh` builds pczip and `cmd/gendata` and generates the
+datasets. It times every tool with the same stdin-to-file I/O and checks
+every output with `cmp`. Any tool that is not installed is skipped.
 
-## File format (brief)
+## Limitations
 
-- Magic: 4 bytes `PCZ2` to identify the file.
-- Filename length (uint16), original file size (uint64), filename bytes.
-- Block size (uint32), number of blocks (uint64), then `NumBlocks` compressed-size entries (uint64 each).
-- Followed by the concatenated compressed block payloads. Each block payload begins with a mode byte:
-  - `0xFF` — raw (uncompressed) block bytes follow
-  - `0x00` — LZ token stream follows (see `core/lz.go`)
-
-This layout makes it easy to parallelize compression and decompression by operating on blocks independently.
-
----
-
-## Design Notes
-
-- LZ implementation: simple hash-table based LZ77 that looks for 4-byte anchors and extends matches.
-- Block-level heuristic: if the LZ tokens are not smaller than the raw block, the block is stored raw (avoids inflation).
-- BSP strategy: partitions blocks into contiguous chunks and lets each worker process its assigned chunk.
-- Work-stealing strategy: uses a Chase–Lev deque implementation (`core/wsdeque.go`) to distribute block indices dynamically among workers; this often yields better load balance on heterogeneous or fragmented data.
-- Barrier primitive (`core/barrier.go`) is used for simple synchronization where needed.
-
----
-
-## Benchmarking
-
-A benchmark script `benchmark.py` is included to generate datasets and measure speedups for the parallel implementations. It expects the built CLI to be named `pczip` in the repo root (the script builds it if needed).
-
-To run the benchmark (may take significant time and disk space depending on configured dataset sizes):
-
-```bash
-# install python deps (matplotlib for plotting)
-python3 -m pip install --user matplotlib
-
-# build the binary used by the script
-go build -o pczip main.go
-
-# run the benchmark
-python3 benchmark.py
-```
-
-The script generates datasets, runs `seq` to get a baseline, then runs `bsp` and `ws` with various thread counts, verifies integrity (decompress with `seq`) and produces PNG plots of speedups.
-
----
-
-## Project layout
-
-- `main.go`          — CLI entrypoint and flag parsing
-- `go.mod`           — module file (module `proj3`)
-- `core/`            — core compression implementation
-  - `lz.go`          — LZ tokenization and decompression
-  - `format.go`      — file header read/write
-  - `sequential.go`  — sequential compressor/decompressor
-  - `bsp.go`         — BSP-style parallel implementation
-  - `worksteal.go`   — work-stealing parallel implementation
-  - `wsdeque.go`     — Chase–Lev deque used by work-stealing
-  - `barrier.go`     — small barrier synchronization primitive
-- `benchmark.py`     — Python benchmarking / dataset generators
-
----
-
-## Limitations & Caveats
-
-- Not intended to be a fully hardened/production compressor — edge-cases and file-system errors are handled conservatively but there is no fuzzer-tested stability guarantee.
-- Memory usage: parallel implementations may load the whole input into memory (BSP/WS), which increases peak memory compared to streaming sequential mode.
-- The LZ matcher and token encoding are simple and aimed at teaching/experimentation rather than optimal compression ratio.
-
----
-
-## Contributing
-
-Contributions are welcome. If you plan to submit pull requests, consider:
-
-- Adding tests for new features (small sample files, integrity checks).
-- Keeping changes scoped and adding documentation to `README.md`.
-
-If you'd like, I can add a `CONTRIBUTING.md` and a few basic unit tests.
-
----
+- **The codec is LZ4-class, not zstd-class.** It has no entropy stage and no
+  dictionary, so its ratio trails both gzip and zstd on every dataset
+  measured.
+- **Old files are not readable.** The format is PCZ3, which is not
+  compatible with `.pcz` files from earlier versions of this repository
+  (PCZ2).
+- **The benchmarks are synthetic,** measured on one 2-vCPU burstable
+  machine, and do not cover more than 2 cores.
+- **Durability is partial.** The output file is fsynced before the rename,
+  but its directory is not.
 
 ## License
 
-This project currently has no explicit license file. If you want to make it public, consider adding an open-source license such as MIT or Apache-2.0. Tell me which license to add and I will create a `LICENSE` file.
-
----
-
-If you'd like, I can also:
-
-- Commit this `README.md` to the repo and push it.
-- Add a `.gitignore` tuned for Go builds and Python artifacts.
-- Add a simple GitHub Actions CI workflow that runs `go test` (if/when tests are present) or `go vet`/`golangci-lint`.
-
-Tell me which of the above you'd like me to do next.
+MIT. See [LICENSE](LICENSE).

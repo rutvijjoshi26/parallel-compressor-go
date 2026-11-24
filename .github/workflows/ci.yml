@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          # No go.sum (no dependencies), so there is nothing to key a cache on.
+          cache: false
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        if: runner.os != 'Windows'
+        run: go test -race ./...
+
+      # -race needs cgo and a C toolchain on Windows, so run without it there.
+      - name: go test
+        if: runner.os == 'Windows'
+        run: go test ./...
+
+      - name: fuzz smoke (15 s per target)
+        if: runner.os == 'Linux'
+        run: |
+          for target in FuzzDecodeBlock FuzzReadStream FuzzBlockRoundTrip; do
+            go test -run='^$' -fuzz="^${target}\$" -fuzztime=15s ./pcz/
+          done
+
+      - name: bench.sh syntax check
+        if: runner.os == 'Linux'
+        run: bash -n scripts/bench.sh
