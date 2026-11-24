@@ -1,0 +1,100 @@
+package core
+
+import (
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func loadBlocks(t *testing.T) [][]byte {
+	data, err := os.ReadFile("../../in/mixed_40m")
+	if err != nil {
+		t.Skip(err)
+	}
+	var bl [][]byte
+	for s := 0; s < len(data); s += 1 << 20 {
+		bl = append(bl, data[s:s+(1<<20)])
+	}
+	return bl
+}
+
+// Compare the in-process cost of the three schedulers over the same 40 x 1 MiB blocks.
+func TestSchedulerCompare(t *testing.T) {
+	bl := loadBlocks(t)
+	out := make([][]byte, len(bl))
+	const W = 2
+	run := func(name string, f func()) {
+		best := time.Hour
+		for i := 0; i < 5; i++ {
+			s := time.Now()
+			f()
+			if d := time.Since(s); d < best {
+				best = d
+			}
+		}
+		t.Logf("%-14s best of 5: %v", name, best)
+	}
+	run("sequential", func() {
+		for i := range bl {
+			out[i] = lzCompressTokens(bl[i])
+		}
+	})
+	run("atomic-counter", func() {
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for w := 0; w < W; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(next.Add(1) - 1)
+					if i >= len(bl) {
+						return
+					}
+					out[i] = lzCompressTokens(bl[i])
+				}
+			}()
+		}
+		wg.Wait()
+	})
+	run("static-chunks", func() {
+		var wg sync.WaitGroup
+		c := (len(bl) + W - 1) / W
+		for w := 0; w < W; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := w * c; i < (w+1)*c && i < len(bl); i++ {
+					out[i] = lzCompressTokens(bl[i])
+				}
+			}(w)
+		}
+		wg.Wait()
+	})
+	run("chase-lev", func() {
+		dq := []*WSDeque{NewWSDeque(len(bl)), NewWSDeque(len(bl))}
+		for i := range bl {
+			dq[i%W].PushBottom(i)
+		}
+		var wg sync.WaitGroup
+		for w := 0; w < W; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for {
+					i, ok := dq[w].PopBottom()
+					if !ok {
+						i, ok = dq[1-w].Steal()
+						if !ok {
+							return
+						}
+					}
+					out[i] = lzCompressTokens(bl[i])
+				}
+			}(w)
+		}
+		wg.Wait()
+	})
+}
