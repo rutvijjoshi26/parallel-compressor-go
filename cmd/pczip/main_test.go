@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -93,6 +94,58 @@ func TestCLIRoundTrip(t *testing.T) {
 				t.Fatalf("compress exit %d, stderr: %s", code, stderr)
 			}
 			if code, _, stderr := runCLI(t, nil, append(append([]string{"-d"}, tc.args...), pcz, back)...); code != 0 {
+				t.Fatalf("decompress exit %d, stderr: %s", code, stderr)
+			}
+			if !bytes.Equal(readFile(t, back), data) {
+				t.Fatal("round trip mismatch")
+			}
+			assertNoTemp(t, dir)
+		})
+	}
+}
+
+// gzipInput returns a gzip stream of about n bytes, made with the standard
+// library: incompressible chunks of 270 to 310 bytes, each followed by a
+// Flush, which writes the same 4-byte sync marker every time. Such input
+// once made the encoder emit a truncated LZ payload that compressed with
+// exit 0 but could not be decompressed.
+func gzipInput(t *testing.T, n int) []byte {
+	t.Helper()
+	r := rand.New(rand.NewPCG(3, 4))
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	chunk := make([]byte, 310)
+	for buf.Len() < n {
+		c := chunk[:270+r.IntN(41)]
+		for i := range c {
+			c[i] = byte(r.Uint32())
+		}
+		if _, err := zw.Write(c); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestCLIRoundTripGzipInput(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.gz")
+	pcz := filepath.Join(dir, "in.pcz")
+	back := filepath.Join(dir, "back.gz")
+	data := gzipInput(t, 256<<10)
+	writeFile(t, in, data)
+	for _, block := range []string{"4KiB", "1MiB"} {
+		t.Run(block, func(t *testing.T) {
+			if code, _, stderr := runCLI(t, nil, "-block", block, in, pcz); code != 0 {
+				t.Fatalf("compress exit %d, stderr: %s", code, stderr)
+			}
+			if code, _, stderr := runCLI(t, nil, "-d", pcz, back); code != 0 {
 				t.Fatalf("decompress exit %d, stderr: %s", code, stderr)
 			}
 			if !bytes.Equal(readFile(t, back), data) {
