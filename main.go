@@ -4,7 +4,7 @@ import (
 	"flag"
 	"os"
 
-	"proj3/core"
+	"github.com/rutvijjoshi26/parallel-compressor-go/core"
 )
 
 func main() {
