@@ -106,8 +106,8 @@ All integers are little-endian.
 - **Block size:** the default is 1 MiB. The valid range is 4 KiB to 64 MiB,
   and a reader rejects any value outside it.
 
-**The decoder never** panics, and it never allocates more than
-`blockSize + 64` bytes per block based on numbers it read from the stream.
+**The decoder never** panics, and when it sizes a buffer from numbers it
+read from the stream, no single allocation exceeds `blockSize + 64` bytes.
 It rejects all of the following:
 
 - `rawLen > blockSize`;
