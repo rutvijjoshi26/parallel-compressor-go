@@ -196,6 +196,27 @@ func TestTempGuardInterruptRemoves(t *testing.T) {
 	}
 }
 
+// TestTempGuardInterruptClosesFile: interrupt must close the open temp
+// file before removing it, since Windows cannot delete an open file.
+func TestTempGuardInterruptClosesFile(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "x.tmp-1")
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	g := &tempGuard{path: tmp}
+	g.setFile(f)
+	g.interrupt()
+	if _, err := f.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("write after interrupt: err %v, want os.ErrClosed", err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("temp file still exists (stat err %v)", err)
+	}
+}
+
 func TestCLIHelp(t *testing.T) {
 	code, out, stderr := runCLI(t, nil, "-h")
 	if code != 0 {

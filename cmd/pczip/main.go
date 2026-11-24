@@ -194,15 +194,27 @@ func checkSameFile(inPath, outPath string) error {
 type tempGuard struct {
 	mu       sync.Mutex
 	path     string
+	file     *os.File // the open temp file, closed by interrupt
 	released bool
 }
 
-// interrupt removes the temp file unless release already ran. It returns
-// with the mutex held so that the rename cannot run before the caller
-// exits the process.
+// setFile records the open temp file so that interrupt can close it.
+func (g *tempGuard) setFile(f *os.File) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.file = f
+}
+
+// interrupt closes and removes the temp file unless release already ran.
+// The close comes first because Windows cannot delete a file that is still
+// open. It returns with the mutex held so that the rename cannot run before
+// the caller exits the process.
 func (g *tempGuard) interrupt() {
 	g.mu.Lock()
 	if !g.released {
+		if g.file != nil {
+			g.file.Close()
+		}
 		os.Remove(g.path)
 	}
 }
@@ -266,6 +278,7 @@ func writeAtomic(path string, fill func(io.Writer) error) (err error) {
 		g.release(nil)
 		return err
 	}
+	g.setFile(f)
 	defer func() {
 		if err != nil {
 			f.Close()
