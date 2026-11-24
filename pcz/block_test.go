@@ -3,6 +3,7 @@ package pcz
 import (
 	"bytes"
 	"math/rand"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -153,4 +154,76 @@ func FuzzBlockRoundTrip(f *testing.F) {
 	f.Add([]byte("abcabcabcabcabcabcabc"))
 	f.Add(englishText(3000))
 	f.Fuzz(func(t *testing.T, src []byte) { roundTrip(t, src) })
+}
+
+// BenchmarkEncodeRandom32MiB encodes 32 MiB of random data as 32 blocks of
+// 1 MiB each, the worst case for the raw fallback.
+func BenchmarkEncodeRandom32MiB(b *testing.B) {
+	src := randomBytes(32 * mib)
+	dst := make([]byte, 0, mib+1)
+	b.SetBytes(int64(len(src)))
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		for off := 0; off < len(src); off += mib {
+			dst = EncodeBlock(dst[:0], src[off:off+mib])
+		}
+	}
+}
+
+func TestRandom1MiBRoundTripsRaw(t *testing.T) {
+	src := randomBytes(mib)
+	payload := EncodeBlock(nil, src)
+	if payload[0] != modeRaw || len(payload) != len(src)+1 {
+		t.Fatalf("mode %#x len %d, want raw of len %d", payload[0], len(payload), len(src)+1)
+	}
+	got, err := DecodeBlock(nil, payload, len(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, src) {
+		t.Fatal("round trip mismatch")
+	}
+}
+
+// TestEncodeDeterministic guards the skip acceleration: encoding the same
+// input twice must give identical bytes.
+func TestEncodeDeterministic(t *testing.T) {
+	src := append(englishText(mib/2), randomBytes(mib/2)...)
+	a := EncodeBlock(nil, src)
+	b := EncodeBlock(nil, src)
+	if !bytes.Equal(a, b) {
+		t.Fatal("EncodeBlock is not deterministic")
+	}
+	roundTrip(t, src)
+}
+
+// TestDecodeKnownAnswer: one literal 'a', then a match at offset 1 of
+// length 4+15+5 = 24, then an empty last sequence: 25 bytes of 'a'.
+func TestDecodeKnownAnswer(t *testing.T) {
+	payload := []byte{0x00, 0x1F, 'a', 0x01, 0x00, 0x05, 0x00}
+	got, err := DecodeBlock(nil, payload, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := bytes.Repeat([]byte{'a'}, 25); !bytes.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// TestDecodeTinyPayloadSmallAlloc: a 2-byte payload claiming 64 MiB of
+// output must not make DecodeBlock reserve 64 MiB up front.
+func TestDecodeTinyPayloadSmallAlloc(t *testing.T) {
+	payload := []byte{0x00, 0x00}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for k := 0; k < 4; k++ {
+		if _, err := DecodeBlock(nil, payload, 64*mib); err == nil {
+			t.Fatal("expected error")
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 64<<10 {
+		t.Fatalf("4 decodes allocated %d bytes, want <= 64 KiB", got)
+	}
 }

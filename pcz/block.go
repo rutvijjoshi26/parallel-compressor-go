@@ -91,8 +91,11 @@ func encodeLZ(dst, src []byte, limit int) []byte {
 	var table [hashSize]int32 // position+1; 0 means empty
 	anchor := 0
 	i := 0
+	misses := 0 // consecutive hash misses since the last match
 	for i+minMatch <= len(src) {
-		if len(dst) >= limit {
+		// Pending literals will be emitted too, so count them: on
+		// incompressible input this bails out as soon as raw must win.
+		if len(dst)+(i-anchor) >= limit {
 			return dst
 		}
 		v := binary.LittleEndian.Uint32(src[i:])
@@ -100,9 +103,12 @@ func encodeLZ(dst, src []byte, limit int) []byte {
 		cand := int(table[h]) - 1
 		table[h] = int32(i + 1)
 		if cand < 0 || i-cand > maxOffset || binary.LittleEndian.Uint32(src[cand:]) != v {
-			i++
+			// LZ4-style skip acceleration: step further the longer we miss.
+			i += 1 + misses>>6
+			misses++
 			continue
 		}
+		misses = 0
 		n := minMatch
 		for i+n < len(src) && src[cand+n] == src[i+n] {
 			n++
@@ -157,7 +163,10 @@ func DecodeBlock(dst, payload []byte, rawLen int) ([]byte, error) {
 func decodeLZ(dst, p []byte, rawLen int) ([]byte, error) {
 	base := len(dst)
 	orig := dst
-	dst = slices.Grow(dst, rawLen) // rawLen is bounded by the caller (≤ blockSize)
+	// Reserve up front, but no more than the payload can expand to: each
+	// payload byte yields at most 255 output bytes, so a tiny hostile
+	// payload cannot force a huge allocation. append grows past this if needed.
+	dst = slices.Grow(dst, min(rawLen, 255*(len(p)+1)+16))
 	pos := 0
 	for {
 		if pos >= len(p) {
