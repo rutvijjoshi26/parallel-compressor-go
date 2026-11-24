@@ -310,7 +310,9 @@ func TestCLISameInOut(t *testing.T) {
 		skipErr error
 	}{
 		{"same-path", []string{in, in}, nil},
-		{"unclean-path", []string{in, filepath.Join(dir, ".", "sub", "..", "in.bin")}, nil},
+		// Concatenated, not filepath.Join, which would clean it.
+		{"unclean-path", []string{in, dir + string(filepath.Separator) + "." + string(filepath.Separator) +
+			"sub" + string(filepath.Separator) + ".." + string(filepath.Separator) + "in.bin"}, nil},
 		{"symlink", []string{in, link}, symErr},
 		{"hardlink", []string{in, hard}, hardErr},
 		{"decompress", []string{"-d", in, in}, nil},
