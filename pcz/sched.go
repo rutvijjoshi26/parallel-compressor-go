@@ -52,19 +52,18 @@ type errState struct {
 	failed atomic.Bool
 	once   sync.Once
 	err    error
+	// onFail, when non-nil, runs once right after the first error is
+	// recorded. It is a test seam (nil in production) that lets tests order
+	// events deterministically around the failure.
+	onFail func()
 }
-
-// afterFail, when non-nil, runs once right after the first error is
-// recorded. It is a test seam (nil in production) that lets tests order
-// events deterministically around the failure.
-var afterFail func()
 
 func (e *errState) set(err error) {
 	e.once.Do(func() {
 		e.err = err
 		e.failed.Store(true)
-		if afterFail != nil {
-			afterFail()
+		if e.onFail != nil {
+			e.onFail()
 		}
 	})
 }
@@ -74,6 +73,13 @@ func (e *errState) set(err error) {
 // started is skipped. With workers <= 1 or n <= 1, fn runs inline on the
 // caller's goroutine.
 func forEachBlock(n, workers int, sched Sched, fn func(i int) error) error {
+	return forEachBlockHook(n, workers, sched, fn, nil)
+}
+
+// forEachBlockHook is forEachBlock with a test seam: onFail, when non-nil,
+// runs once right after the first worker error is recorded (parallel paths
+// only).
+func forEachBlockHook(n, workers int, sched Sched, fn func(i int) error, onFail func()) error {
 	if sched != Static && sched != Steal {
 		return fmt.Errorf("pcz: unknown scheduler %v", sched)
 	}
@@ -92,15 +98,15 @@ func forEachBlock(n, workers int, sched Sched, fn func(i int) error) error {
 		return nil
 	}
 	if sched == Static {
-		return runStatic(n, workers, fn)
+		return runStatic(n, workers, fn, onFail)
 	}
-	return runSteal(n, workers, fn)
+	return runSteal(n, workers, fn, onFail)
 }
 
 // runStatic splits [0,n) into workers contiguous chunks whose sizes differ
 // by at most one.
-func runStatic(n, workers int, fn func(i int) error) error {
-	var es errState
+func runStatic(n, workers int, fn func(i int) error, onFail func()) error {
+	es := errState{onFail: onFail}
 	var wg sync.WaitGroup
 	base, extra := n/workers, n%workers
 	lo := 0
@@ -135,7 +141,7 @@ func runStatic(n, workers int, fn func(i int) error) error {
 // race for the top task. So workers count taken tasks in a shared remaining
 // counter and exit only when it reaches zero (or an error is recorded),
 // yielding between fruitless steal rounds.
-func runSteal(n, workers int, fn func(i int) error) error {
+func runSteal(n, workers int, fn func(i int) error, onFail func()) error {
 	perWorker := (n + workers - 1) / workers
 	deques := make([]*chaselev.Deque, workers)
 	for w := range deques {
@@ -149,7 +155,7 @@ func runSteal(n, workers int, fn func(i int) error) error {
 		}
 	}
 
-	var es errState
+	es := errState{onFail: onFail}
 	var remaining atomic.Int64
 	remaining.Store(int64(n))
 	var wg sync.WaitGroup

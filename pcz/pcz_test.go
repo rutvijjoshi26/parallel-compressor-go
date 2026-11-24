@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -228,5 +229,45 @@ func TestOptionsInvalid(t *testing.T) {
 		if err := Compress(io.Discard, bytes.NewReader(nil), opt); !errors.Is(err, ErrOptions) {
 			t.Fatalf("Compress(%+v): err = %v, want ErrOptions", opt, err)
 		}
+	}
+}
+
+func TestWorkersTooMany(t *testing.T) {
+	for _, w := range []int{MaxWorkers + 1, math.MaxInt / 2} {
+		opt := Options{Workers: w}
+		if err := Compress(io.Discard, bytes.NewReader([]byte("x")), opt); !errors.Is(err, ErrOptions) {
+			t.Fatalf("Compress workers %d: err = %v, want ErrOptions", w, err)
+		}
+		if err := Decompress(io.Discard, bytes.NewReader(nil), opt); !errors.Is(err, ErrOptions) {
+			t.Fatalf("Decompress workers %d: err = %v, want ErrOptions", w, err)
+		}
+	}
+}
+
+func TestWorkersMaxTinyInput(t *testing.T) {
+	opt := Options{Workers: MaxWorkers, Sched: Steal}
+	comp := compressBytes(t, []byte{'x'}, opt)
+	var got bytes.Buffer
+	if err := Decompress(&got, bytes.NewReader(comp), opt); err != nil {
+		t.Fatalf("Decompress: %v", err)
+	}
+	if got.String() != "x" {
+		t.Fatalf("round trip = %q, want %q", got.String(), "x")
+	}
+}
+
+// Decode errors keep their underlying cause in the chain alongside ErrFormat.
+func TestDecodeErrorChain(t *testing.T) {
+	var buf bytes.Buffer
+	_ = writeHeader(&buf, MinBlockSize)
+	_ = writeFrame(&buf, frame{rawLen: 5, payload: []byte{0xFF, 'h', 'i'}}) // raw body too short
+	_ = writeEnd(&buf)
+	err := Decompress(io.Discard, &buf, Options{Workers: 1})
+	if !errors.Is(err, ErrFormat) {
+		t.Fatalf("err = %v, want ErrFormat", err)
+	}
+	var multi interface{ Unwrap() []error }
+	if !errors.As(err, &multi) || len(multi.Unwrap()) != 2 {
+		t.Fatalf("err %v does not wrap both ErrFormat and the decode error", err)
 	}
 }

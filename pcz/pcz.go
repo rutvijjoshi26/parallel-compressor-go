@@ -22,13 +22,16 @@ type Options struct {
 // ErrOptions reports invalid Options.
 var ErrOptions = errors.New("pcz: invalid options")
 
+// MaxWorkers is the largest accepted Options.Workers.
+const MaxWorkers = 1024
+
 // blocksPerWorker bounds memory: at most Workers*blocksPerWorker blocks are
 // in flight at once, whatever the input size.
 const blocksPerWorker = 4
 
 func (o Options) check() error {
-	if o.Workers < 1 {
-		return fmt.Errorf("%w: workers %d < 1", ErrOptions, o.Workers)
+	if o.Workers < 1 || o.Workers > MaxWorkers {
+		return fmt.Errorf("%w: workers %d outside [1, %d]", ErrOptions, o.Workers, MaxWorkers)
 	}
 	if o.Sched != Static && o.Sched != Steal {
 		return fmt.Errorf("%w: unknown scheduler %v", ErrOptions, o.Sched)
@@ -37,7 +40,8 @@ func (o Options) check() error {
 }
 
 // Compress reads src to EOF and writes it to dst as a PCZ3 stream. The
-// output is byte-identical for every Workers and Sched value.
+// output is byte-identical for every Workers and Sched value. On error, dst
+// may already hold the header and the frames of earlier blocks.
 func Compress(dst io.Writer, src io.Reader, opt Options) error {
 	if err := opt.check(); err != nil {
 		return err
@@ -54,15 +58,18 @@ func Compress(dst io.Writer, src io.Reader, opt Options) error {
 	}
 
 	batch := opt.Workers * blocksPerWorker
-	raws := make([][]byte, batch) // reused across batches
-	frames := make([]frame, batch)
+	// Grown on demand up to batch and reused across batches, so a small
+	// input never allocates for workers it does not need.
+	var raws [][]byte
+	var frames []frame
 	for eof := false; !eof; {
 		// Read up to batch full blocks. io.ReadFull makes block boundaries
 		// independent of how src chunks its reads.
 		n := 0
 		for n < batch {
-			if raws[n] == nil {
-				raws[n] = make([]byte, bs)
+			if n == len(raws) {
+				raws = append(raws, make([]byte, bs))
+				frames = append(frames, frame{})
 			}
 			m, err := io.ReadFull(src, raws[n][:bs])
 			if m > 0 {
@@ -113,11 +120,17 @@ func Decompress(dst io.Writer, src io.Reader, opt Options) error {
 	}
 
 	batch := opt.Workers * blocksPerWorker
-	frames := make([]frame, batch) // payload buffers reused across batches
-	outs := make([][]byte, batch)
+	// Grown on demand up to batch; payload and output buffers are reused
+	// across batches.
+	var frames []frame
+	var outs [][]byte
 	for end := false; !end; {
 		n := 0
 		for n < batch {
+			if n == len(frames) {
+				frames = append(frames, frame{})
+				outs = append(outs, nil)
+			}
 			f, isEnd, err := readFrameBuf(src, bs, frames[n].payload[:0])
 			if err != nil {
 				return err
@@ -134,7 +147,7 @@ func Decompress(dst io.Writer, src io.Reader, opt Options) error {
 			f := frames[i]
 			out, err := DecodeBlock(outs[i][:0], f.payload, f.rawLen)
 			if err != nil {
-				return fmt.Errorf("%w: %v", ErrFormat, err)
+				return fmt.Errorf("%w: %w", ErrFormat, err)
 			}
 			outs[i] = out
 			if crc32.ChecksumIEEE(out) != f.crc {

@@ -129,13 +129,11 @@ func TestSkipAfterError(t *testing.T) {
 	for _, sched := range allScheds {
 		t.Run(sched.String(), func(t *testing.T) {
 			recorded := make(chan struct{})
-			afterFail = func() { close(recorded) }
-			defer func() { afterFail = nil }()
 			want := errors.New("boom")
 			var started atomic.Int32
 			done := make(chan error, 1)
 			go func() {
-				done <- forEachBlock(100, 2, sched, func(i int) error {
+				done <- forEachBlockHook(100, 2, sched, func(i int) error {
 					switch started.Add(1) {
 					case 1:
 						<-recorded // held until the other worker's error is recorded
@@ -144,7 +142,7 @@ func TestSkipAfterError(t *testing.T) {
 						return want
 					}
 					return nil
-				})
+				}, func() { close(recorded) })
 			}()
 			select {
 			case err := <-done:
